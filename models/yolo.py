@@ -45,9 +45,20 @@ from models.common import (
     DWConvTranspose2d,
     Expand,
     Focus,
+    FFM_Concat2,
+    FFM_Concat3,
     GhostBottleneck,
     GhostConv,
     Proto,
+    FEM,
+    SPPFCSPC,
+    SCAM,
+    C2f,
+    C3_Faster,
+    C3STR,
+    ASPP,
+    CBAM
+
 )
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
@@ -124,6 +135,128 @@ class Detect(nn.Module):
         yv, xv = torch.meshgrid(y, x, indexing="ij") if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
         grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
         anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        return grid, anchor_grid
+
+class CLLA(nn.Module):
+    def __init__(self, range, c):
+        super().__init__()
+        self.c_ = c
+        self.q = nn.Linear(self.c_, self.c_)
+        self.k = nn.Linear(self.c_, self.c_)
+        self.v = nn.Linear(self.c_, self.c_)
+        self.range = range
+        self.attend = nn.Softmax(dim = -1)
+
+    def forward(self, x1, x2):
+        b1, c1, w1, h1 = x1.shape
+        b2, c2, w2, h2 = x2.shape
+        assert b1 == b2 and c1 == c2
+
+        x2_ = x2.permute(0, 2, 3, 1).contiguous().unsqueeze(3)
+        pad = int(self.range / 2 - 1)
+        padding = nn.ZeroPad2d(padding=(pad, pad, pad, pad))
+        x1 = padding(x1)
+
+        local = []
+        for i in range(int(self.range)):
+            for j in range(int(self.range)):
+                tem = x1
+                tem = tem[..., i::2, j::2][..., :w2, :h2].contiguous().unsqueeze(2)
+                local.append(tem)
+        local = torch.cat(local, 2)
+
+        x1 = local.permute(0, 3, 4, 2, 1)
+
+        q = self.q(x2_)
+        k, v = self.k(x1), self.v(x1)
+
+        dots = torch.sum(q * k / self.range, 4)
+        irr = torch.mean(dots, 3).unsqueeze(3) * 2 - dots
+        att = self.attend(irr)
+
+        out = v * att.unsqueeze(4)
+        out = torch.sum(out, 3)
+        out = out.squeeze(3).permute(0, 3, 1, 2).contiguous()
+        # x2 = x2.squeeze(3).permute(0, 3, 1, 2).contiguous()
+        return (out + x2) / 2
+        # return out
+
+class CLLABlock(nn.Module):
+    def __init__(self, range=2, ch=256, ch1=128, ch2=256, out=0):
+        super().__init__()
+        self.range = range
+        self.c_ = ch
+        self.cout = out
+        self.conv1 = nn.Conv2d(ch1, self.c_, 1)
+        self.conv2 = nn.Conv2d(ch2, self.c_, 1)
+
+        self.att = CLLA(range = range, c = self.c_)
+
+        self.det = nn.Conv2d(self.c_, out, 1)
+
+    def forward(self, x1, x2):
+        x1 = self.conv1(x1)
+        x2 = self.conv2(x2)
+
+        f = self.att(x1, x2)
+
+        return self.det(f)
+
+
+class CLLADetect(nn.Module):
+    stride = None  # strides computed during build
+    onnx_dynamic = False  # ONNX export parameter
+
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        self.anchor_grid = [torch.zeros(1)] * self.nl  # init anchor grid
+        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
+        self.det = CLLABlock(range = 2, ch = ch[0], ch1 = ch[0], ch2 = ch[1], out = self.no * self.na)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[2:])  # output conv
+        self.inplace = inplace  # use in-place ops (e.g. slice assignment)
+
+    def forward(self, x):
+        z = []  # inference output
+        p = []
+        for i in range(self.nl):
+            if i == 0:
+                p.append(self.det(x[0], x[1]))
+            else:
+                p.append(self.m[i-1](x[i+1]))  # conv
+            bs, _, ny, nx = p[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+
+            p[i] = p[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:  # inference
+                if self.onnx_dynamic or self.grid[i].shape[2:4] != p[i].shape[2:4]:
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
+
+                y = p[i].sigmoid()
+                if self.inplace:
+                    y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
+                    xy = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, y[..., 4:]), -1)
+                z.append(y.view(bs, -1, self.no))
+        return p if self.training else (torch.cat(z, 1), p)
+        # return x if self.training else (z[0], x) # (torch.cat(z, 1), x)
+
+    def _make_grid(self, nx=20, ny=20, i=0):
+        d = self.anchors[i].device
+        if check_version(torch.__version__, '1.10.0'):  # torch>=1.10.0 meshgrid workaround for torch>=0.7 compatibility
+            yv, xv = torch.meshgrid([torch.arange(ny).to(d), torch.arange(nx).to(d)], indexing='ij')
+        else:
+            yv, xv = torch.meshgrid([torch.arange(ny).to(d), torch.arange(nx).to(d)])
+        grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
+        anchor_grid = (self.anchors[i].clone() * self.stride[i]) \
+            .view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
         return grid, anchor_grid
 
 
@@ -244,7 +377,7 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment)) or isinstance(m, CLLADetect):
 
             def _forward(x):
                 """Passes the input 'x' through the model and returns the processed output."""
@@ -283,6 +416,8 @@ class DetectionModel(BaseModel):
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
+    
+   
 
     def _descale_pred(self, p, flips, scale, img_size):
         """De-scales predictions from augmented inference, adjusting for flips and image size."""
@@ -415,24 +550,33 @@ def parse_model(d, ch):
             BottleneckCSP,
             C3,
             C3TR,
+            C3STR,
             C3SPP,
             C3Ghost,
+            ASPP,
+            CBAM,
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            FEM,
+            SPPFCSPC,
         }:
+            print(args, ch, f, n, m)  # print args
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, ch_mul)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {BottleneckCSP, C3, C3TR, C3STR, C3Ghost, C3x, C2f, C3_Faster}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m in {SCAM}:
+            c2 = ch[f]
+            args = [c2]
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
@@ -440,8 +584,18 @@ def parse_model(d, ch):
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if m is Segment:
                 args[3] = make_divisible(args[3] * gw, ch_mul)
+        elif m is CLLADetect:
+            args.append([ch[x] for x in f])
+            if isinstance(args[1], int):  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * (len(f) - 1)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
+        elif m is FFM_Concat2:
+            c2 = sum(ch[x] for x in f)
+            args = [args[0], c2//2, c2//2]
+        elif m is FFM_Concat3:
+            c2 = sum(ch[x] for x in f)
+            args = [args[0], c2//4, c2//2, c2//4]
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
         else:
