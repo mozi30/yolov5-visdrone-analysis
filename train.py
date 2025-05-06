@@ -32,7 +32,7 @@ except ImportError:
 
 import numpy as np
 import torch
-torch.use_deterministic_algorithms(False)
+torch.use_deterministic_algorithms(True, warn_only=True)
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
