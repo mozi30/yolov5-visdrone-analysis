@@ -1,0 +1,1 @@
+python train.py --weights yolov5s.pt --cfg models/FFCA-YOLO.yaml --data data/Visdrone.yaml --batch-size 32 --epochs 300
