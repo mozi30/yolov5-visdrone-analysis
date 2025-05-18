@@ -30,6 +30,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -689,7 +691,9 @@ def compute_ap50_and_ap(records, total_gt, recall_points=101):
         if np.any(recall_mask):
             filtered_recalls = recalls[recall_mask]
             filtered_precisions = precisions[recall_mask]
-            ap50 = np.trapz(filtered_precisions, filtered_recalls)  # Area under curve
+            ap50 = np.trapezoid(filtered_precisions, filtered_recalls)  # Area under curve
+        else:
+            ap50 = 0.0  # No recall values >= 0.5
 
     # Compute AP@0.5:0.95
     recall_levels = np.linspace(0, 1, recall_points)
@@ -701,6 +705,27 @@ def compute_ap50_and_ap(records, total_gt, recall_points=101):
 
     return ap50, ap
 
+def plot_precision_recall_curve(records, total_gt, bin_name):
+    if total_gt == 0 or len(records) == 0:
+        print(f"No data to plot for bin {bin_name}")
+        return
+
+    # Sort records by confidence descending
+    records = sorted(records, key=lambda x: -x[0])
+    tps = np.cumsum([int(r[1]) for r in records])  # True positives cumulative sum
+    fps = np.cumsum([int(not r[1]) for r in records])  # False positives cumulative sum
+    precisions = tps / (tps + fps + 1e-16)  # Precision
+    recalls = tps / total_gt  # Recall
+
+    # Plot Precision-Recall curve
+    plt.figure(figsize=(8, 6))
+    plt.plot(recalls, precisions, marker='o', label=f"Bin: {bin_name}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"Precision-Recall Curve for Bin {bin_name}")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
 
 def print_size_bin_metrics():
     print("\n=== Per-size-bin evaluation results ===")
@@ -713,6 +738,7 @@ def print_size_bin_metrics():
         ap50, ap = compute_ap50_and_ap(per_bin_records[b], gt)
         print(f"Bin {b}: GT={gt}, TP={tp}, FP={fp}, "
               f"Precision={precision:.3f}, Recall={recall:.3f}, AP50={ap50:.3f}, AP={ap:.3f}")
+        plot_precision_recall_curve(per_bin_records[b], gt, b)
 # --- END size-split validation enhancements ---
 
 if __name__ == "__main__":
