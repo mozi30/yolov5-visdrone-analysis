@@ -185,7 +185,6 @@ def process_batch(detections, labels, iouv):
             correct[matches[:, 1].astype(int), i] = True
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
-
 @smart_inference_mode()
 def run(
     data,
@@ -291,6 +290,8 @@ def run(
     nc = 1 if single_cls else int(data["nc"])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
+    bin_counts = {b: {'gt': 0, 'tp': 0, 'fp': 0} for b in size_bins}
+    per_bin_records = {b: {float(iou): [] for iou in iouv.cpu().numpy()} for b in size_bins}
 
     # Dataloader
     if not training:
@@ -381,7 +382,7 @@ def run(
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
-                validate_one_image(labelsn, predn, iouv)
+                validate_one_image(labelsn, predn, iouv.cpu().numpy(), bin_counts, per_bin_records)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
@@ -467,7 +468,7 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    print_size_bin_metrics()
+    print_size_bin_metrics(bin_counts, per_bin_records, iouv.cpu().numpy())
     return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
@@ -602,152 +603,124 @@ def main(opt):
         else:
             raise NotImplementedError(f'--task {opt.task} not in ("train", "val", "test", "speed", "study")')
 
+
 # --- BEGIN size-split validation enhancements ---
 import numpy as np
 from collections import defaultdict
 
 # Define size bins
 size_bins = ['<8', '8-16', '16-32', '32-64', '>64']
-bin_counts = {b: {'gt': 0, 'tp': 0, 'fp': 0} for b in size_bins}
-per_bin_records = {b: [] for b in size_bins}
 
-def get_bin(w, h, bins):
+def get_bin(w, h):
     size = max(w, h)
     if size < 8:
         return '<8'
-    elif 8 <= size <= 16:
+    elif size <= 16:
         return '8-16'
-    elif 16 < size <= 32:
+    elif size <= 32:
         return '16-32'
-    elif 32 < size <= 64:
+    elif size <= 64:
         return '32-64'
     else:
         return '>64'
 
-def process_batch_with_matches(detections, labels, iouv):
-    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
-    iou = box_iou(labels[:, 1:], detections[:, :4])
-    correct_class = labels[:, 0:1] == detections[:, 5]
-    matches = []
+def compute_precision_recall(records, total_gt):
+    records = sorted(records, key=lambda x: -x[0])  # sort by confidence
+    tps = np.cumsum([r[1] for r in records])
+    fps = np.cumsum([not r[1] for r in records])
+    precision = tps / (tps + fps + 1e-16)
+    recall = tps / (total_gt + 1e-16)
+    return precision, recall
 
-    for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)
-        if x[0].shape[0]:
-            m = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if m.shape[0] > 1:
-                m = m[m[:, 2].argsort()[::-1]]
-                m = m[np.unique(m[:, 1], return_index=True)[1]]
-                m = m[np.unique(m[:, 0], return_index=True)[1]]
-            for label_idx, pred_idx, iou_val in m:
-                matches.append((int(label_idx), int(pred_idx), float(iou_val)))
-            correct[m[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=iouv.device), matches
+def compute_ap(precision, recall):
+    precision = np.concatenate(([0.0], precision, [0.0]))
+    recall = np.concatenate(([0.0], recall, [1.0]))
+    for i in range(len(precision) - 1, 0, -1):
+        precision[i - 1] = np.maximum(precision[i - 1], precision[i])
+    idx = np.where(recall[1:] != recall[:-1])[0]
+    return np.sum((recall[idx + 1] - recall[idx]) * precision[idx + 1])
 
-def validate_one_image(labelsn, predn, iouv):
-    label_boxes = labelsn[:, 1:5]
-    label_bins = [get_bin(x2 - x1, y2 - y1, size_bins) for x1, y1, x2, y2 in label_boxes]
-
-    for b in label_bins:
-        if b is not None:
-            bin_counts[b]['gt'] += 1
-
-    correct, matches = process_batch_with_matches(predn, labelsn, iouv)
-    matched_pred_idxs = set()
-
-    matched_labels = set()
-    matched_preds = set()
-
-    for label_idx, pred_idx, _ in matches:
-        if label_idx in matched_labels or pred_idx in matched_preds:
-            continue  # already matched
-        b = label_bins[label_idx]
-        if b is not None:
-            bin_counts[b]['tp'] += 1
-            per_bin_records[b].append((float(predn[pred_idx, 4]), True))
-        matched_labels.add(label_idx)
-        matched_preds.add(pred_idx)
-
-    for pi in range(predn.shape[0]):
-        if pi not in matched_pred_idxs:
-            w, h = predn[pi, 2] - predn[pi, 0], predn[pi, 3] - predn[pi, 1]
-            b = get_bin(w, h, size_bins)
-            bin_counts[b]['fp'] += 1
-            per_bin_records[b].append((float(predn[pi, 4]), False))
-
-def compute_ap50_and_ap(records, total_gt, recall_points=101):
-    if total_gt == 0:
-        return 0.0, 0.0
-
-    # Sort records by confidence descending
-    records = sorted(records, key=lambda x: -x[0])
-    tps = np.cumsum([int(r[1]) for r in records])  # True positives cumulative sum
-    fps = np.cumsum([int(not r[1]) for r in records])  # False positives cumulative sum
-    precisions = tps / (tps + fps + 1e-16)  # Precision
-    recalls = tps / total_gt  # Recall
-
-    # Compute AP@0.5
-    ap50 = 0.0
-    if len(records) > 0:
-        # Filter precision and recall for IoU = 0.5
-        recall_mask = recalls >= 0.5
-        if np.any(recall_mask):
-            filtered_recalls = recalls[recall_mask]
-            filtered_precisions = precisions[recall_mask]
-            ap50 = np.trapezoid(filtered_precisions, filtered_recalls)  # Area under curve
-        else:
-            ap50 = 0.0  # No recall values >= 0.5
-
-    # Compute AP@0.5:0.95
-    iou_thresholds = np.linspace(0.5, 0.95, 10)  # IoU thresholds: 0.5, 0.55, ..., 0.95
+def compute_bin_ap(iou_records, total_gt, iou_thresholds):
     ap_values = []
-    for iou in iou_thresholds:
-        recall_mask = recalls >= iou
-        if np.any(recall_mask):
-            filtered_recalls = recalls[recall_mask]
-            filtered_precisions = precisions[recall_mask]
-            ap = np.trapz(filtered_precisions, filtered_recalls)  # Area under curve
-            ap_values.append(ap)
+    for iou_thresh in iou_thresholds:
+        records = iou_records.get(iou_thresh, [])
+        if total_gt == 0 or not records:
+            ap_values.append(0.0)
         else:
-            ap_values.append(0.0)  # No recall values for this IoU threshold
+            precision, recall = compute_precision_recall(records, total_gt)
+            ap = compute_ap(precision, recall)
+            ap_values.append(ap)
+    return ap_values[0], np.mean(ap_values)  # AP@0.5, AP@0.5:0.95
 
-    ap = float(np.mean(ap_values))  # Mean AP across IoU thresholds
+def process_batch_with_matches(detections, labels, iouv):
+    correct = np.zeros((detections.shape[0], len(iouv)), dtype=bool)
+    iou_matrix = box_iou(labels[:, 1:], detections[:, :4]).cpu().numpy()
+    correct_class = labels[:, 0:1].cpu().numpy() == detections[:, 5].cpu().numpy()
+    matches = defaultdict(list)
 
-    return ap50, ap
+    for idx, iou_threshold in enumerate(iouv):
+        used_labels, used_detections = set(), set()
+        for label_idx in range(len(labels)):
+            for det_idx in np.argsort(-detections[:, 4].cpu().numpy()):
+                if (
+                    label_idx not in used_labels and
+                    det_idx not in used_detections and
+                    correct_class[label_idx, det_idx] and
+                    iou_matrix[label_idx, det_idx] >= iou_threshold
+                ):
+                    used_labels.add(label_idx)
+                    used_detections.add(det_idx)
+                    correct[det_idx, idx] = True
+                    matches[iou_threshold].append((label_idx, det_idx, True, float(detections[det_idx, 4])))
+        # Add unmatched detections as false positives
+        for det_idx in range(len(detections)):
+            if det_idx not in used_detections:
+                matches[iou_threshold].append((-1, det_idx, False, float(detections[det_idx, 4])))
 
-def plot_precision_recall_curve(records, total_gt, bin_name):
-    if total_gt == 0 or len(records) == 0:
-        print(f"No data to plot for bin {bin_name}")
+    return torch.tensor(correct, dtype=torch.bool, device=detections.device), matches
+
+def validate_one_image(labelsn, predn, iouv, bin_counts, per_bin_records):
+    if labelsn.shape[0] == 0 and predn.shape[0] == 0:
         return
 
-    # Sort records by confidence descending
-    records = sorted(records, key=lambda x: -x[0])
-    tps = np.cumsum([int(r[1]) for r in records])  # True positives cumulative sum
-    fps = np.cumsum([int(not r[1]) for r in records])  # False positives cumulative sum
-    precisions = tps / (tps + fps + 1e-16)  # Precision
-    recalls = tps / total_gt  # Recall
+    label_boxes = labelsn[:, 1:5]
+    label_bins = [get_bin(x2 - x1, y2 - y1) for x1, y1, x2, y2 in label_boxes]
 
-    # Plot Precision-Recall curve
-    plt.figure(figsize=(8, 6))
-    plt.plot(recalls, precisions, marker='o', label=f"Bin: {bin_name}")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(f"Precision-Recall Curve for Bin {bin_name}")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+    for b in label_bins:
+        bin_counts[b]['gt'] += 1
 
-def print_size_bin_metrics():
+    _, matches = process_batch_with_matches(predn, labelsn, iouv)
+
+    for iou_thresh, match_info in matches.items():
+        matched_preds = set()
+        for label_idx, det_idx, is_tp, conf in match_info:
+            if is_tp:
+                if label_idx < len(label_bins):
+                    b = label_bins[label_idx]
+                    if iou_thresh == 0.5:
+                        bin_counts[b]['tp'] += 1
+                    per_bin_records[b][iou_thresh].append((conf, True))
+            else:
+                if det_idx not in matched_preds and det_idx < predn.shape[0]:
+                    w = predn[det_idx, 2] - predn[det_idx, 0]
+                    h = predn[det_idx, 3] - predn[det_idx, 1]
+                    b = get_bin(w, h)
+                    if iou_thresh == 0.5:
+                        bin_counts[b]['fp'] += 1
+                    per_bin_records[b][iou_thresh].append((conf, False))
+                    matched_preds.add(det_idx)
+
+def print_size_bin_metrics(bin_counts, per_bin_records, iou_thresholds):
     print("\n=== Per-size-bin evaluation results ===")
     for b in size_bins:
-        gt = bin_counts[b]['gt']  # Ground truth count
-        tp = bin_counts[b]['tp']  # True positives
-        fp = bin_counts[b]['fp']  # False positives
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / gt if gt > 0 else 0.0
-        ap50, ap = compute_ap50_and_ap(per_bin_records[b], gt)
+        gt = bin_counts[b]['gt']
+        tp = bin_counts[b]['tp']
+        fp = bin_counts[b]['fp']
+        precision = tp / (tp + fp + 1e-16) if (tp + fp) > 0 else 0.0
+        recall = tp / (gt + 1e-16) if gt > 0 else 0.0
+        ap50, ap95 = compute_bin_ap(per_bin_records[b], gt, iou_thresholds)
         print(f"Bin {b}: GT={gt}, TP={tp}, FP={fp}, "
-              f"Precision={precision:.3f}, Recall={recall:.3f}, AP50={ap50:.3f}, AP={ap:.3f}")
-        plot_precision_recall_curve(per_bin_records[b], gt, b)
+              f"Precision={precision:.3f}, Recall={recall:.3f}, AP50={ap50:.3f}, AP50-95={ap95:.3f}")
 # --- END size-split validation enhancements ---
 
 if __name__ == "__main__":
