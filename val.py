@@ -379,6 +379,7 @@ def run(
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
+                validate_one_image(labelsn, predn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
@@ -464,6 +465,7 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
+    print_size_bin_metrics()
     return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
@@ -598,6 +600,100 @@ def main(opt):
         else:
             raise NotImplementedError(f'--task {opt.task} not in ("train", "val", "test", "speed", "study")')
 
+# --- BEGIN size-split validation enhancements ---
+import numpy as np
+from collections import defaultdict
+
+# Define size bins
+size_bins = [8, 16, 32, 64]
+bin_counts = {b: {'gt': 0, 'tp': 0, 'fp': 0} for b in size_bins}
+per_bin_records = {b: [] for b in size_bins}
+
+def get_bin(w, h, bins):
+    size = max(w, h)
+    for b in bins:
+        if size <= b:
+            return b
+    return None
+
+def process_batch_with_matches(detections, labels, iouv):
+    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    iou = box_iou(labels[:, 1:], detections[:, :4])
+    correct_class = labels[:, 0:1] == detections[:, 5]
+    matches = []
+
+    for i in range(len(iouv)):
+        x = torch.where((iou >= iouv[i]) & correct_class)
+        if x[0].shape[0]:
+            m = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            if m.shape[0] > 1:
+                m = m[m[:, 2].argsort()[::-1]]
+                m = m[np.unique(m[:, 1], return_index=True)[1]]
+                m = m[np.unique(m[:, 0], return_index=True)[1]]
+            for label_idx, pred_idx, iou_val in m:
+                matches.append((int(label_idx), int(pred_idx), float(iou_val)))
+            correct[m[:, 1].astype(int), i] = True
+    return torch.tensor(correct, dtype=torch.bool, device=iouv.device), matches
+
+def validate_one_image(labelsn, predn, iouv):
+    label_boxes = labelsn[:, 1:5]
+    label_bins = [get_bin(x2 - x1, y2 - y1, size_bins) for x1, y1, x2, y2 in label_boxes]
+
+    for b in label_bins:
+        if b is not None:
+            bin_counts[b]['gt'] += 1
+
+    correct, matches = process_batch_with_matches(predn, labelsn, iouv)
+    matched_pred_idxs = set()
+
+    matched_labels = set()
+    matched_preds = set()
+
+    for label_idx, pred_idx, _ in matches:
+        if label_idx in matched_labels or pred_idx in matched_preds:
+            continue  # already matched
+        b = label_bins[label_idx]
+        if b is not None:
+            bin_counts[b]['tp'] += 1
+            per_bin_records[b].append((float(predn[pred_idx, 4]), True))
+        matched_labels.add(label_idx)
+        matched_preds.add(pred_idx)
+
+    for pi in range(predn.shape[0]):
+        if pi not in matched_pred_idxs:
+            w, h = predn[pi, 2] - predn[pi, 0], predn[pi, 3] - predn[pi, 1]
+            b = get_bin(w, h, size_bins) or size_bins[-1]
+            bin_counts[b]['fp'] += 1
+            per_bin_records[b].append((float(predn[pi, 4]), False))
+
+def compute_ap(records, total_gt, recall_points=101):
+    if total_gt == 0:
+        return 0.0
+    records = sorted(records, key=lambda x: -x[0])
+    tps = np.cumsum([int(r[1]) for r in records])
+    fps = np.cumsum([int(not r[1]) for r in records])
+    precisions = tps / (tps + fps + 1e-16)
+    recalls = tps / total_gt
+
+    recall_levels = np.linspace(0, 1, recall_points)
+    prec_at_recall = []
+    for rl in recall_levels:
+        precs = precisions[recalls >= rl]
+        prec_at_recall.append(np.max(precs) if precs.size else 0.0)
+    return float(np.mean(prec_at_recall))
+
+def print_size_bin_metrics():
+    print("\n=== Per-size-bin evaluation results ===")
+    for b in size_bins:
+        gt = bin_counts[b]['gt']
+        tp = bin_counts[b]['tp']
+        fp = bin_counts[b]['fp']
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / gt if gt > 0 else 0.0
+        ap = compute_ap(per_bin_records[b], gt)
+        print(f"Bin ≤ {b}×{b}: GT={gt}, TP={tp}, FP={fp}, "
+              f"Precision={precision:.3f}, Recall={recall:.3f}, AP={ap:.3f}")
+# --- END size-split validation enhancements ---
 
 if __name__ == "__main__":
     opt = parse_opt()
