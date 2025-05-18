@@ -675,16 +675,21 @@ def validate_one_image(labelsn, predn, iouv):
 def compute_ap50_and_ap(records, total_gt, recall_points=101):
     if total_gt == 0:
         return 0.0, 0.0
-    records = sorted(records, key=lambda x: -x[0])
-    tps = np.cumsum([int(r[1]) for r in records])
-    fps = np.cumsum([int(not r[1]) for r in records])
-    precisions = tps / (tps + fps + 1e-16)
-    recalls = tps / total_gt
+    records = sorted(records, key=lambda x: -x[0])  # Sort by confidence descending
+    tps = np.cumsum([int(r[1]) for r in records])  # True positives cumulative sum
+    fps = np.cumsum([int(not r[1]) for r in records])  # False positives cumulative sum
+    precisions = tps / (tps + fps + 1e-16)  # Precision
+    recalls = tps / total_gt  # Recall
 
     # Compute AP@0.5
     ap50 = 0.0
     if len(records) > 0:
-        ap50 = precisions[-1] if recalls[-1] >= 0.5 else 0.0
+        # Filter precision and recall for recall >= 0.5
+        recall_mask = recalls >= 0.5
+        if np.any(recall_mask):
+            filtered_recalls = recalls[recall_mask]
+            filtered_precisions = precisions[recall_mask]
+            ap50 = np.trapz(filtered_precisions, filtered_recalls)  # Area under curve
 
     # Compute AP@0.5:0.95
     recall_levels = np.linspace(0, 1, recall_points)
@@ -696,12 +701,13 @@ def compute_ap50_and_ap(records, total_gt, recall_points=101):
 
     return ap50, ap
 
+
 def print_size_bin_metrics():
     print("\n=== Per-size-bin evaluation results ===")
     for b in size_bins:
-        gt = bin_counts[b]['gt']
-        tp = bin_counts[b]['tp']
-        fp = bin_counts[b]['fp']
+        gt = bin_counts[b]['gt']  # Ground truth count
+        tp = bin_counts[b]['tp']  # True positives
+        fp = bin_counts[b]['fp']  # False positives
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / gt if gt > 0 else 0.0
         ap50, ap = compute_ap50_and_ap(per_bin_records[b], gt)
