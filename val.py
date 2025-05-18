@@ -605,7 +605,7 @@ import numpy as np
 from collections import defaultdict
 
 # Define size bins
-size_bins = [8, 16, 32, 64]
+size_bins = ['<8', '8-16', '16-32', '32-64', '>64']
 bin_counts = {b: {'gt': 0, 'tp': 0, 'fp': 0} for b in size_bins}
 per_bin_records = {b: [] for b in size_bins}
 
