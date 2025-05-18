@@ -677,7 +677,9 @@ def validate_one_image(labelsn, predn, iouv):
 def compute_ap50_and_ap(records, total_gt, recall_points=101):
     if total_gt == 0:
         return 0.0, 0.0
-    records = sorted(records, key=lambda x: -x[0])  # Sort by confidence descending
+
+    # Sort records by confidence descending
+    records = sorted(records, key=lambda x: -x[0])
     tps = np.cumsum([int(r[1]) for r in records])  # True positives cumulative sum
     fps = np.cumsum([int(not r[1]) for r in records])  # False positives cumulative sum
     precisions = tps / (tps + fps + 1e-16)  # Precision
@@ -686,7 +688,7 @@ def compute_ap50_and_ap(records, total_gt, recall_points=101):
     # Compute AP@0.5
     ap50 = 0.0
     if len(records) > 0:
-        # Filter precision and recall for recall >= 0.5
+        # Filter precision and recall for IoU = 0.5
         recall_mask = recalls >= 0.5
         if np.any(recall_mask):
             filtered_recalls = recalls[recall_mask]
@@ -696,12 +698,19 @@ def compute_ap50_and_ap(records, total_gt, recall_points=101):
             ap50 = 0.0  # No recall values >= 0.5
 
     # Compute AP@0.5:0.95
-    recall_levels = np.linspace(0, 1, recall_points)
-    prec_at_recall = []
-    for rl in recall_levels:
-        precs = precisions[recalls >= rl]
-        prec_at_recall.append(np.max(precs) if precs.size else 0.0)
-    ap = float(np.mean(prec_at_recall))
+    iou_thresholds = np.linspace(0.5, 0.95, 10)  # IoU thresholds: 0.5, 0.55, ..., 0.95
+    ap_values = []
+    for iou in iou_thresholds:
+        recall_mask = recalls >= iou
+        if np.any(recall_mask):
+            filtered_recalls = recalls[recall_mask]
+            filtered_precisions = precisions[recall_mask]
+            ap = np.trapz(filtered_precisions, filtered_recalls)  # Area under curve
+            ap_values.append(ap)
+        else:
+            ap_values.append(0.0)  # No recall values for this IoU threshold
+
+    ap = float(np.mean(ap_values))  # Mean AP across IoU thresholds
 
     return ap50, ap
 
