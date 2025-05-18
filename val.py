@@ -611,10 +611,16 @@ per_bin_records = {b: [] for b in size_bins}
 
 def get_bin(w, h, bins):
     size = max(w, h)
-    for b in bins:
-        if size <= b:
-            return b
-    return None
+    if size < 8:
+        return '<8'
+    elif 8 <= size <= 16:
+        return '8-16'
+    elif 16 < size <= 32:
+        return '16-32'
+    elif 32 < size <= 64:
+        return '32-64'
+    else:
+        return '>64'
 
 def process_batch_with_matches(detections, labels, iouv):
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
@@ -662,25 +668,33 @@ def validate_one_image(labelsn, predn, iouv):
     for pi in range(predn.shape[0]):
         if pi not in matched_pred_idxs:
             w, h = predn[pi, 2] - predn[pi, 0], predn[pi, 3] - predn[pi, 1]
-            b = get_bin(w, h, size_bins) or size_bins[-1]
+            b = get_bin(w, h, size_bins)
             bin_counts[b]['fp'] += 1
             per_bin_records[b].append((float(predn[pi, 4]), False))
 
-def compute_ap(records, total_gt, recall_points=101):
+def compute_ap50_and_ap(records, total_gt, recall_points=101):
     if total_gt == 0:
-        return 0.0
+        return 0.0, 0.0
     records = sorted(records, key=lambda x: -x[0])
     tps = np.cumsum([int(r[1]) for r in records])
     fps = np.cumsum([int(not r[1]) for r in records])
     precisions = tps / (tps + fps + 1e-16)
     recalls = tps / total_gt
 
+    # Compute AP@0.5
+    ap50 = 0.0
+    if len(records) > 0:
+        ap50 = precisions[-1] if recalls[-1] >= 0.5 else 0.0
+
+    # Compute AP@0.5:0.95
     recall_levels = np.linspace(0, 1, recall_points)
     prec_at_recall = []
     for rl in recall_levels:
         precs = precisions[recalls >= rl]
         prec_at_recall.append(np.max(precs) if precs.size else 0.0)
-    return float(np.mean(prec_at_recall))
+    ap = float(np.mean(prec_at_recall))
+
+    return ap50, ap
 
 def print_size_bin_metrics():
     print("\n=== Per-size-bin evaluation results ===")
@@ -690,9 +704,9 @@ def print_size_bin_metrics():
         fp = bin_counts[b]['fp']
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / gt if gt > 0 else 0.0
-        ap = compute_ap(per_bin_records[b], gt)
-        print(f"Bin ≤ {b}×{b}: GT={gt}, TP={tp}, FP={fp}, "
-              f"Precision={precision:.3f}, Recall={recall:.3f}, AP={ap:.3f}")
+        ap50, ap = compute_ap50_and_ap(per_bin_records[b], gt)
+        print(f"Bin {b}: GT={gt}, TP={tp}, FP={fp}, "
+              f"Precision={precision:.3f}, Recall={recall:.3f}, AP50={ap50:.3f}, AP={ap:.3f}")
 # --- END size-split validation enhancements ---
 
 if __name__ == "__main__":
